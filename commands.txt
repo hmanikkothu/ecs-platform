@@ -1,0 +1,59 @@
+git clone https://github.com/hmanikkothu/ecs-platform
+git clone https://github.com/hmanikkothu/ecs-nodejs-frontend
+git clone https://github.com/hmanikkothu/ecs-nodejs-backend
+
+# Ensure service linked roles exist for Load Balancers and ECS:
+aws iam get-role --role-name "AWSServiceRoleForElasticLoadBalancing" || aws iam create-service-linked-role --aws-service-name "elasticloadbalancing.amazonaws.com"
+aws iam get-role --role-name "AWSServiceRoleForECS" || aws iam create-service-linked-role --aws-service-name "ecs.amazonaws.com"
+
+# Build a VPC, ECS Cluster, and ALB
+cd ecs-platform/
+aws cloudformation deploy --stack-name ecs-nodejs-dev --template-file cluster-fargate-vpc.yml --capabilities CAPABILITY_IAM
+aws cloudformation deploy --stack-name ecs-nodejs-dev-alb --template-file alb-external.yml
+
+=========
+# Set env variables
+
+export clustername=$(aws cloudformation describe-stacks --stack-name ecs-nodejs-dev --query 'Stacks[0].Outputs[?OutputKey==`ClusterName`].OutputValue' --output text)
+export target_group_arn=$(aws cloudformation describe-stack-resources --stack-name ecs-nodejs-dev-alb | jq -r '.[][] | select(.ResourceType=="AWS::ElasticLoadBalancingV2::TargetGroup").PhysicalResourceId')
+export vpc=$(aws cloudformation describe-stacks --stack-name ecs-nodejs-dev --query 'Stacks[0].Outputs[?OutputKey==`VpcId`].OutputValue' --output text)
+export ecsTaskExecutionRole=$(aws cloudformation describe-stacks --stack-name ecs-nodejs-dev --query 'Stacks[0].Outputs[?OutputKey==`ECSTaskExecutionRole`].OutputValue' --output text)
+export subnet_1=$(aws cloudformation describe-stacks --stack-name ecs-nodejs-dev --query 'Stacks[0].Outputs[?OutputKey==`PrivateSubnetOne`].OutputValue' --output text)
+export subnet_2=$(aws cloudformation describe-stacks --stack-name ecs-nodejs-dev --query 'Stacks[0].Outputs[?OutputKey==`PrivateSubnetTwo`].OutputValue' --output text)
+export subnet_3=$(aws cloudformation describe-stacks --stack-name ecs-nodejs-dev --query 'Stacks[0].Outputs[?OutputKey==`PrivateSubnetThree`].OutputValue' --output text)
+export security_group=$(aws cloudformation describe-stacks --stack-name ecs-nodejs-dev --query 'Stacks[0].Outputs[?OutputKey==`ContainerSecurityGroup`].OutputValue' --output text)
+
+# Configure ecs-cli to talk to the new cluster
+ecs-cli configure --region $AWS_REGION --cluster $clustername --default-launch-type FARGATE --config-name ecs-nodejs-dev
+
+# The above command creates entry in '/home/ec2-user/.ecs/config' file
+
+aws ec2 authorize-security-group-ingress --group-id "$security_group" --protocol tcp --port 3000 --cidr 0.0.0.0/0
+
+=========
+# deploy frontend app
+
+cd /ecs-nodejs-frontend/
+envsubst < ecs-params.yml.template >ecs-params.yml
+
+ecs-cli compose --project-name ecs-nodejs-dev-frontend service up \
+    --create-log-groups \
+    --target-group-arn $target_group_arn \
+    --private-dns-namespace service \
+    --enable-service-discovery \
+    --container-name ecs-nodejs-frontend \
+    --container-port 3000 \
+    --cluster-config ecs-nodejs-dev \
+    --vpc $vpc
+
+=============
+cd ecs-nodejs-backend/
+envsubst < ecs-params.yml.template >ecs-params.yml
+
+ecs-cli compose --project-name ecs-nodejs-dev-backend service up \
+    --create-log-groups \
+    --private-dns-namespace service \
+    --enable-service-discovery \
+    --cluster-config ecs-nodejs-dev \
+    --vpc $vpc
+    
